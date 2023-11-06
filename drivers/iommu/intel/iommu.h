@@ -18,6 +18,7 @@
 #include <linux/list.h>
 #include <linux/iommu.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
+#include <linux/io-pgtable.h>
 #include <linux/dmar.h>
 #include <linux/bitfield.h>
 #include <linux/xarray.h>
@@ -584,6 +585,11 @@ struct iommu_domain_info {
 					 * to VT-d spec, section 9.3 */
 };
 
+struct dmar_io_pgtable {
+	struct io_pgtable_cfg   pgtbl_cfg;
+	struct io_pgtable       iop;
+};
+
 struct dmar_domain {
 	int	nid;			/* node id */
 	struct xarray iommu_array;	/* Attached IOMMU array */
@@ -656,6 +662,7 @@ struct dmar_domain {
 
 	struct iommu_domain domain;	/* generic domain data structure for
 					   iommu core */
+	struct dmar_io_pgtable dmar_iop;
 };
 
 /*
