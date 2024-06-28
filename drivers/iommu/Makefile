@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0
 obj-y += amd/ intel/ arm/ iommufd/ riscv/
+obj-$(CONFIG_GENERIC_PT) += generic_pt/
 obj-$(CONFIG_IOMMU_API) += iommu.o
 obj-$(CONFIG_IOMMU_API) += iommu-pages.o
 obj-$(CONFIG_IOMMU_API) += iommu-traces.o
