@@ -11,6 +11,7 @@
 struct iommu_iotlb_gather;
 struct pt_iommu_ops;
 struct pt_iommu_flush_ops;
+struct iommu_dirty_bitmap;
 
 /**
  * DOC: IOMMU Radix Page Table
@@ -122,6 +123,35 @@ struct pt_iommu_ops {
 			      struct iommu_iotlb_gather *iotlb_gather);
 
 	/**
+	 * cut_mapping() - Split a mapping
+	 * @iommu_table: Table to manipulate
+	 * @iova: IO virtual address to cut at
+	 * @gfp: GFP flags for any memory allocations
+	 *
+	 * If map was used on [iova_a, iova_b] then unmap must be used on the
+	 * same interval. When called twice this is useful to unmap a portion of
+	 * a larger mapping.
+	 *
+	 * cut_mapping() changes the page table so that umap of both:
+	 *    [iova_a, iova_c - 1]
+	 *    [iova_c, iova_b]
+	 * will work.
+	 *
+	 * In practice this is done by breaking up large pages into smaller
+	 * pages so that no large page crosses iova_c.
+	 *
+	 * cut_mapping() works to ensure all page sizes that don't cross the cut
+	 * remain at the optimal sizes.
+	 *
+	 * Context: The caller must hold a write range lock that includes the
+	 * entire range used with the map that contains iova.
+	 *
+	 * Returns: -ERRNO on failure, 0 on success.
+	 */
+	int (*cut_mapping)(struct pt_iommu *iommu_table, dma_addr_t cut_iova,
+			   gfp_t gfp);
+
+	/**
 	 * iova_to_phys() - Return the output address for the given IOVA
 	 * @iommu_table: Table to query
 	 * @iova: IO virtual address to query
@@ -136,6 +166,39 @@ struct pt_iommu_ops {
 	 */
 	phys_addr_t (*iova_to_phys)(struct pt_iommu *iommu_table,
 				    dma_addr_t iova);
+
+	/**
+	 * read_and_clear_dirty() - Manipulate the HW set write dirty state
+	 * @iommu_table: Table to manipulate
+	 * @iova: IO virtual address to start
+	 * @size: Length of the IOVA
+	 * @flags: A bitmap of IOMMU_DIRTY_NO_CLEAR
+	 *
+	 * Iterate over all the entries in the mapped range and record their
+	 * write dirty status in iommu_dirty_bitmap. If IOMMU_DIRTY_NO_CLEAR is
+	 * not specified then the entries will be left dirty, otherwise they are
+	 * returned to being not write dirty.
+	 *
+	 * Context: The caller must hold a read range lock that includes @iova.
+	 *
+	 * Returns: -ERRNO on failure, 0 on success.
+	 */
+	int (*read_and_clear_dirty)(struct pt_iommu *iommu_table,
+				    dma_addr_t iova, dma_addr_t len,
+				    unsigned long flags,
+				    struct iommu_dirty_bitmap *dirty_bitmap);
+
+	/**
+	 * set_dirty() - Make the iova write dirty
+	 * @iommu_table: Table to manipulate
+	 * @iova: IO virtual address to start
+	 *
+	 * This is only used by iommufd testing. It makes the iova dirty so that
+	 * read_and_clear_dirty() will see it as dirty. Unlike all the other ops
+	 * this one is safe to call without holding any locking. It may return
+	 * -EAGAIN if there is a race.
+	 */
+	int (*set_dirty)(struct pt_iommu *iommu_table, dma_addr_t iova);
 
 	/**
 	 * get_info() - Return the pt_iommu_info structure

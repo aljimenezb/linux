@@ -130,6 +130,127 @@ static phys_addr_t NS(iova_to_phys)(struct pt_iommu *iommu_table,
 	return res;
 }
 
+struct pt_iommu_dirty_args {
+	struct iommu_dirty_bitmap *dirty;
+	unsigned int flags;
+};
+
+static void record_dirty(struct pt_state *pts,
+			 struct pt_iommu_dirty_args *dirty,
+			 unsigned int num_contig_lg2)
+{
+	pt_vaddr_t dirty_len;
+
+	if (num_contig_lg2 != ilog2(1)) {
+		unsigned int index = pts->index;
+		unsigned int end_index = log2_set_mod_max_t(
+			unsigned int, pts->index, num_contig_lg2);
+
+		/* Adjust for being contained inside a contiguous page */
+		end_index = min(end_index, pts->end_index);
+		dirty_len = (end_index - index) *
+				log2_to_int(pt_table_item_lg2sz(pts));
+	} else {
+		dirty_len = log2_to_int(pt_table_item_lg2sz(pts));
+	}
+
+	if (dirty->dirty->bitmap)
+		iova_bitmap_set(dirty->dirty->bitmap, pts->range->va,
+				dirty_len);
+
+	if (!(dirty->flags & IOMMU_DIRTY_NO_CLEAR)) {
+		/*
+		 * No write log required because DMA incoherence and atomic
+		 * dirty tracking bits can't work together
+		 */
+		pt_entry_set_write_clean(pts);
+		/* FIXME update the gather
+		if (dirty->dirty->gather)
+		*/
+	}
+}
+
+/* FIXME this is a bit big on formats with contig.. */
+static __always_inline int
+__do_read_and_clear_dirty(struct pt_range *range, void *arg, unsigned int level,
+			  struct pt_table_p *table, pt_level_fn_t descend_fn)
+{
+	struct pt_state pts = pt_init(range, level, table);
+	struct pt_iommu_dirty_args *dirty = arg;
+	int ret;
+
+	for_each_pt_level_item(&pts) {
+		if (pts.type == PT_ENTRY_TABLE) {
+			ret = pt_descend(&pts, arg, descend_fn);
+			if (ret)
+				return ret;
+			continue;
+		}
+		if (pts.type == PT_ENTRY_OA && pt_entry_write_is_dirty(&pts))
+			record_dirty(&pts, dirty,
+				     pt_entry_num_contig_lg2(&pts));
+	}
+	return 0;
+}
+PT_MAKE_LEVELS(__read_and_clear_dirty, __do_read_and_clear_dirty);
+
+static int __maybe_unused NS(read_and_clear_dirty)(
+	struct pt_iommu *iommu_table, dma_addr_t iova, dma_addr_t len,
+	unsigned long flags, struct iommu_dirty_bitmap *dirty_bitmap)
+{
+	struct pt_iommu_dirty_args dirty = {
+		.dirty = dirty_bitmap,
+		.flags = flags,
+	};
+	struct pt_range range;
+	int ret;
+
+	ret = make_range(common_from_iommu(iommu_table), &range, iova, len);
+	if (ret)
+		return ret;
+
+	ret = pt_walk_range(&range, __read_and_clear_dirty, &dirty);
+	PT_WARN_ON(ret);
+	return ret;
+}
+
+static __always_inline int __do_set_dirty(struct pt_range *range, void *arg,
+					  unsigned int level,
+					  struct pt_table_p *table,
+					  pt_level_fn_t descend_fn)
+{
+	struct pt_state pts = pt_init(range, level, table);
+
+	switch (pt_load_single_entry(&pts)) {
+	case PT_ENTRY_EMPTY:
+		return -ENOENT;
+	case PT_ENTRY_TABLE:
+		return pt_descend(&pts, arg, descend_fn);
+	case PT_ENTRY_OA:
+		if (!pt_entry_make_write_dirty(&pts))
+			return -EAGAIN;
+		return 0;
+	}
+	return -ENOENT;
+}
+PT_MAKE_LEVELS(__set_dirty, __do_set_dirty);
+
+static int __maybe_unused NS(set_dirty)(struct pt_iommu *iommu_table,
+					dma_addr_t iova)
+{
+	struct pt_range range;
+	int ret;
+
+	ret = make_range(common_from_iommu(iommu_table), &range, iova, 1);
+	if (ret)
+		return ret;
+
+	rcu_read_lock();
+	ret = pt_walk_range(&range, __set_dirty, NULL);
+	rcu_read_unlock();
+	return ret;
+}
+
 struct pt_iommu_collect_args {
 	struct pt_radix_list_head free_list;
 	u8 ignore_mapped : 1;
@@ -248,6 +369,270 @@ struct pt_iommu_map_args {
 	struct pt_write_attrs attrs;
 	pt_oaddr_t oa;
 };
+
+/*
+ * Build an entire sub tree of tables separate from the active table. This is
+ * used to build an entire mapping and then once complete atomically place it in
+ * the table. This is a simplified version of map since we know there is no
+ * concurrency and all the tables start zero filled.
+ */
+static int __build_tree(struct pt_range *range, void *arg, unsigned int level,
+			struct pt_table_p *table)
+{
+	struct pt_state pts = pt_init(range, level, table);
+	struct pt_iommu_map_args *build = arg;
+	int ret;
+
+	for_each_pt_level_item(&pts) {
+		unsigned int pgsize_lg2 =
+			pt_compute_best_pgsize(&pts, build->oa);
+
+		if (pgsize_lg2) {
+			/* Private population can not see table entries other than 0. */
+			if (PT_WARN_ON(pts.type != PT_ENTRY_EMPTY))
+				return -EADDRINUSE;
+
+			pt_install_leaf_entry(&pts, build->oa, pgsize_lg2,
+					      &build->attrs);
+			pts.type = PT_ENTRY_OA;
+			build->oa += log2_to_int(pgsize_lg2);
+			continue;
+		}
+
+		if (pts.type == PT_ENTRY_EMPTY) {
+			/* start_incoherent is done after the table is filled */
+			ret = pt_iommu_new_table(&pts, &build->attrs, true);
+			if (ret)
+				return ret;
+			pt_radix_add_list(&build->free_list, pts.table_lower);
+		} else if (PT_WARN_ON(pts.type != PT_ENTRY_TABLE)) {
+			return -EINVAL;
+		}
+
+		ret = pt_descend(&pts, arg, __build_tree);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * Replace the OA entry patent_pts points at with a tree of OA entries. The tree
+ * is organized so that parent_pts->va is a cut point. The created mappings will
+ * still have optimized page sizes within the cut point.
+ */
+static int replace_cut_table(struct pt_state *parent_pts,
+			     const struct pt_write_attrs *parent_attrs)
+{
+	struct pt_common *common = parent_pts->range->common;
+	struct pt_iommu_map_args build = {
+		.free_list = PT_RADIX_LIST_INIT,
+		.attrs = *parent_attrs,
+		.oa = pt_entry_oa(parent_pts),
+	};
+	pt_vaddr_t cut_start_va = parent_pts->range->va;
+	pt_vaddr_t entry_start_va =
+		log2_set_mod(cut_start_va, 0, pt_table_item_lg2sz(parent_pts));
+	pt_vaddr_t entry_last_va =
+		log2_set_mod_max(cut_start_va, pt_table_item_lg2sz(parent_pts));
+	struct pt_table_p *table_mem;
+	int ret;
+
+	if (unlikely(!pt_can_have_table(parent_pts)))
+		return -ENXIO;
+
+	if (PT_WARN_ON(entry_start_va == cut_start_va))
+		return -ENXIO;
+
+	if (!pts_feature(parent_pts, PT_FEAT_OA_TABLE_XCHG))
+		return -EOPNOTSUPP;
+
+	table_mem = table_alloc(parent_pts, parent_attrs->gfp, true);
+	if (IS_ERR(table_mem))
+		return PTR_ERR(table_mem);
+	pt_radix_add_list(&build.free_list, table_mem);
+	parent_pts->table_lower = table_mem;
+
+	/* Fill from the start of the table to the cut point */
+	ret = pt_walk_child_range(parent_pts, entry_start_va, cut_start_va - 1,
+				  __build_tree, &build);
+	if (ret)
+		goto err_free;
+
+	/* Fill from the cut point to the end of the table */
+	ret = pt_walk_child_range(parent_pts, cut_start_va, entry_last_va,
+				  __build_tree, &build);
+	if (ret)
+		goto err_free;
+
+	/*
+	 * Avoid double flushing when building a tree privately. All the tree
+	 * memory is initialized now so flush it before installing it. This
+	 * thread is the exclusive owner of the item being split so we don't
+	 * need to worry about still flushing.
+	 */
+	if (pt_feature(common, PT_FEAT_DMA_INCOHERENT)) {
+		ret = pt_radix_start_incoherent_list(
+			&build.free_list,
+			iommu_from_common(common)->iommu_device);
+		if (ret)
+			goto err_free;
+	}
+
+	if (!pt_install_table(parent_pts, virt_to_phys(table_mem),
+			      parent_attrs)) {
+		/*
+		 * This only fails if the table entry changed while we were
+		 * building the sub tree, which would be a locking violation.
+		 */
+		WARN(true, "Locking violating during cut");
+		ret = -EINVAL;
+		goto err_free;
+	}
+
+	return 0;
+
+err_free:
+	/*
+	 * None of the allocated memory was ever reachable outside this function
+	 */
+	if (pt_feature(common, PT_FEAT_DMA_INCOHERENT))
+		pt_radix_stop_incoherent_list(
+			&build.free_list,
+			iommu_from_common(common)->iommu_device);
+	pt_radix_free_list(&build.free_list);
+	parent_pts->table_lower = NULL;
+	return ret;
+}
+
+static void __replace_cut_entry(const struct pt_state *parent_pts,
+				pt_oaddr_t oa, struct pt_write_attrs *attrs,
+				unsigned int start_index,
+				unsigned int end_index)
+{
+	struct pt_range range =
+		pt_range_slice(parent_pts, start_index, end_index);
+	struct pt_state pts =
+		pt_init(&range, parent_pts->level, parent_pts->table);
+
+	if (start_index == end_index)
+		return;
+
+	for_each_pt_level_item(&pts) {
+		unsigned int pgsize_lg2 = pt_compute_best_pgsize(&pts, oa);
+
+		if (PT_WARN_ON(pts.type != PT_ENTRY_OA) ||
+		    PT_WARN_ON(!pgsize_lg2))
+			continue;
+
+		pt_install_leaf_entry(&pts, oa, pgsize_lg2, attrs);
+		pts.type = PT_ENTRY_OA;
+		oa += log2_to_int(pgsize_lg2);
+	}
+}
+
+/*
+ * This is a little more complicated than just clearing a contig bit because
+ * some formats have multi-size contigs and we still want to use best page sizes
+ * for each half of the cut. So we remap over the current values with new
+ * correctly sized entries.
+ */
+static void replace_cut_entry(const struct pt_state *parent_pts,
+			      const struct pt_write_attrs *parent_attrs)
+{
+	unsigned int start_index = log2_set_mod(
+		parent_pts->index, 0, pt_entry_num_contig_lg2(parent_pts));
+	unsigned int cut_index = parent_pts->index;
+	unsigned int last_index = log2_set_mod(
+		parent_pts->index,
+		log2_to_int(pt_entry_num_contig_lg2(parent_pts)) - 1,
+		pt_entry_num_contig_lg2(parent_pts));
+	pt_oaddr_t oa = pt_entry_oa(parent_pts);
+	struct pt_write_attrs attrs = *parent_attrs;
+
+	pt_attr_from_entry(parent_pts, &attrs);
+
+	if (!log2_mod(parent_pts->range->va, pt_table_item_lg2sz(parent_pts))) {
+		/* The cut start at an item boundary */
+		__replace_cut_entry(parent_pts, oa, &attrs, start_index,
+				    cut_index);
+		__replace_cut_entry(parent_pts, oa, &attrs, cut_index,
+				    last_index + 1);
+	} else {
+		/* cut_index will be replaced by a table */
+		if (start_index != cut_index)
+			__replace_cut_entry(parent_pts, oa, &attrs, start_index,
+					    cut_index - 1);
+		__replace_cut_entry(parent_pts, oa, &attrs, cut_index,
+				    cut_index + 1);
+		if (cut_index != last_index)
+			__replace_cut_entry(parent_pts, oa, &attrs,
+					    cut_index + 1, last_index + 1);
+	}
+}
+
+static int __cut_mapping(struct pt_range *range, void *arg, unsigned int level,
+			 struct pt_table_p *table)
+{
+	struct iommu_write_log wlog __cleanup(done_writes) = { .range = range };
+	struct pt_state pts = pt_init(range, level, table);
+	const struct pt_write_attrs *cut_attrs = arg;
+
+again:
+	switch (pt_load_single_entry(&pts)) {
+	case PT_ENTRY_EMPTY:
+		return -ENOENT;
+	case PT_ENTRY_TABLE:
+		return pt_descend(&pts, arg, __cut_mapping);
+	case PT_ENTRY_OA: {
+		/* This entry's OA starts at the cut point, all done */
+		if (!log2_mod(range->va, pt_entry_oa_lg2sz(&pts)))
+			return 0;
+
+		record_write(&wlog, &pts, pt_entry_num_contig_lg2(&pts));
+
+		/* This is a contiguous entry, split it down */
+		if (pt_entry_num_contig_lg2(&pts) != ilog2(1)) {
+			if (!pts_feature(&pts, PT_FEAT_OA_SIZE_CHANGE))
+				return -EOPNOTSUPP;
+			replace_cut_entry(&pts, cut_attrs);
+			goto again;
+		}
+
+		/*
+		 * Need to replace an OA with a table. The new table will map
+		 * the same OA as the table item, just with smaller granularity.
+		 */
+		return replace_cut_table(&pts, cut_attrs);
+	}
+	}
+	return -ENOENT;
+}
+
+/*
+ * FIXME this is currently incompatible with active dirty tracking as we
+ * don't take care to capture or propagate the dirty bits during the mutation.
+ */
+static int NS(cut_mapping)(struct pt_iommu *iommu_table, dma_addr_t cut_iova,
+			   gfp_t gfp)
+{
+	struct pt_common *common = common_from_iommu(iommu_table);
+	struct pt_write_attrs cut_attrs = {
+		.gfp = gfp,
+	};
+	struct pt_range range;
+	int ret;
+
+	ret = pt_iommu_set_prot(common, &cut_attrs, IOMMU_READ);
+	if (ret)
+		return ret;
+
+	ret = make_range(common_from_iommu(iommu_table), &range, cut_iova, 1);
+	if (ret)
+		return ret;
+
+	return pt_walk_range(&range, __cut_mapping, &cut_attrs);
+}
 
 /*
  * Check that the items in a contiguous block are all empty. This will
@@ -531,10 +916,10 @@ static int NS(map_range)(struct pt_iommu *iommu_table, dma_addr_t iova,
 	     oalog2_div(paddr, common->max_oasz_lg2)))
 		return -ERANGE;
 
+	map.attrs.gfp = gfp;
 	ret = pt_iommu_set_prot(common, &map.attrs, prot);
 	if (ret)
 		return ret;
-	map.attrs.gfp = gfp;
 
 	while (1) {
 		ret = make_range(common_from_iommu(iommu_table), &range, iova,
@@ -697,6 +1082,13 @@ static const struct pt_iommu_ops NS(ops) = {
 	.map_range = NS(map_range),
 	.unmap_range = NS(unmap_range),
 	.iova_to_phys = NS(iova_to_phys),
+	.cut_mapping = NS(cut_mapping),
+#if IS_ENABLED(CONFIG_IOMMUFD_DRIVER) && defined(pt_entry_write_is_dirty)
+	.read_and_clear_dirty = NS(read_and_clear_dirty),
+#if IS_ENABLED(CONFIG_IOMMUFD_TEST) && defined(pt_entry_make_write_dirty)
+	.set_dirty = NS(set_dirty),
+#endif
+#endif
 	.get_info = NS(get_info),
 	.deinit = NS(deinit),
 };
@@ -835,5 +1227,7 @@ EXPORT_SYMBOL_NS_GPL(pt_iommu_hw_info, "GENERIC_PT_IOMMU");
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("IOMMU Pagetable implementation for " __stringify(PTPFX_RAW));
 MODULE_IMPORT_NS("GENERIC_PT");
+/* For iommu_dirty_bitmap_record() */
+MODULE_IMPORT_NS("IOMMUFD");
 
 #endif
