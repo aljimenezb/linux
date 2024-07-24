@@ -262,6 +262,18 @@ struct pt_iommu_cfg {
 	u8 hw_max_oasz_lg2;
 };
 
+struct pt_iommu_amdv1 {
+	struct pt_iommu iommu;
+	struct pt_amdv1 amdpt;
+};
+
+struct pt_iommu_amdv1_cfg {
+	struct pt_iommu_cfg common;
+	unsigned int starting_level;
+};
+int pt_iommu_amdv1_init(struct pt_iommu_amdv1 *table,
+			const struct pt_iommu_amdv1_cfg *cfg, gfp_t gfp);
+
 struct pt_iommu_armv8 {
 	struct pt_iommu iommu;
 	struct pt_armv8 armpt;
