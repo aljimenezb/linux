@@ -276,6 +276,18 @@ int pt_iommu_amdv1_init(struct pt_iommu_amdv1 *table,
 int pt_iommu_amdv1_mock_init(struct pt_iommu_amdv1 *table,
 			     const struct pt_iommu_amdv1_cfg *cfg, gfp_t gfp);
 
+struct pt_iommu_armv7s {
+	struct pt_iommu iommu;
+	struct pt_armv7s armpt;
+};
+
+struct pt_iommu_armv7s_cfg {
+	struct pt_iommu_cfg common;
+};
+
+int pt_iommu_armv7s_init(struct pt_iommu_armv7s *table,
+			 const struct pt_iommu_armv7s_cfg *cfg, gfp_t gfp);
+
 struct pt_iommu_armv8 {
 	struct pt_iommu iommu;
 	struct pt_armv8 armpt;
