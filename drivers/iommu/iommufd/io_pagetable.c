@@ -477,28 +477,32 @@ static int __iommu_read_and_clear_dirty(struct iova_bitmap *bitmap,
 	return 0;
 }
 
+static bool iommu_have_read_and_clear(struct iommu_domain *domain)
+{
+	if (IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT) && domain->iommupt &&
+	    domain->iommupt->ops->read_and_clear_dirty)
+	    return true;
+
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
+	if (domain->dirty_ops && domain->dirty_ops->read_and_clear_dirty)
+		return true;
+#endif
+	return false;
+}
+
 static int
 iommu_read_and_clear_dirty(struct iommu_domain *domain,
 			   struct io_pagetable *iopt, unsigned long flags,
 			   struct iommu_hwpt_get_dirty_bitmap *bitmap)
 {
-	const struct iommu_dirty_ops *ops = domain->dirty_ops;
 	struct iommu_iotlb_gather gather;
 	struct iommu_dirty_bitmap dirty;
 	struct iova_bitmap_fn_arg arg;
 	struct iova_bitmap *iter;
 	int ret = 0;
 
-	if (!ops)
+	if (!iommu_have_read_and_clear(domain))
 		return -EOPNOTSUPP;
-	if (IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT) && domain->iommupt &&
-	    domain->iommupt->ops->read_and_clear_dirty)
-		return -EOPNOTSUPP;
-
-#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
-	if (!ops->read_and_clear_dirty)
-		return -EOPNOTSUPP;
-#endif
 
 	iter = iova_bitmap_alloc(bitmap->iova, bitmap->length,
 				 bitmap->page_size,
