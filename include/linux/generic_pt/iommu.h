@@ -273,6 +273,8 @@ struct pt_iommu_amdv1_cfg {
 };
 int pt_iommu_amdv1_init(struct pt_iommu_amdv1 *table,
 			const struct pt_iommu_amdv1_cfg *cfg, gfp_t gfp);
+int pt_iommu_amdv1_mock_init(struct pt_iommu_amdv1 *table,
+			     const struct pt_iommu_amdv1_cfg *cfg, gfp_t gfp);
 
 struct pt_iommu_armv8 {
 	struct pt_iommu iommu;
