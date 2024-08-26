@@ -21,6 +21,43 @@ struct kunit_iommu_cmp_priv {
 	struct pt_iommu_table ref_table;
 };
 
+#if IS_ENABLED(CONFIG_IOMMU_PT_KUNIT_BENCHMARK)
+
+#define LOOPS 10000
+
+#define START_TIMER(id)	ktime_t start_##id = ktime_get()
+
+#define STOP_TIMER(id) ktime_to_ns(ktime_sub(ktime_get(), start_##id))
+
+typedef void (*benchmark_fn_t)(struct kunit *test, void *test_args,
+			       unsigned int pgsz_lg2);
+
+struct map_unmap_test_cfg {
+	unsigned int iopte_cnt;
+	pt_vaddr_t pgsize_bitmap;
+	struct cmp_benchmark_results *cmp_results;
+	const char *desc;
+};
+
+enum pt_impl_type {
+	GENPT_IMPL,
+	IOPT_IMPL,
+	PT_IMPL_TYPE_MAX,
+};
+
+struct benchmark_times {
+	ktime_t avg_time;
+	ktime_t max_time;
+	ktime_t min_time;
+};
+
+struct cmp_benchmark_results {
+	struct benchmark_times map_timing[PT_IMPL_TYPE_MAX];
+	struct benchmark_times unmap_timing[PT_IMPL_TYPE_MAX];
+};
+
+#endif
+
 struct compare_tables {
 	struct kunit *test;
 	struct pt_range ref_range;
@@ -158,6 +195,459 @@ static void do_cmp_unmap(struct kunit *test, pt_vaddr_t va, pt_vaddr_t len)
 					       NULL);
 	KUNIT_ASSERT_EQ(test, ret, len);
 }
+
+#if IS_ENABLED(CONFIG_IOMMU_PT_KUNIT_BENCHMARK)
+
+static inline void compute_map_timing_stats(struct cmp_benchmark_results *entry,
+				 unsigned int iterations)
+{
+	struct benchmark_times *map_timing =
+		(struct benchmark_times *)entry->map_timing;
+	struct benchmark_times *unmap_timing =
+		(struct benchmark_times *)&entry->unmap_timing;
+
+	map_timing[GENPT_IMPL].avg_time =
+		div64_ul(map_timing[GENPT_IMPL].avg_time, iterations);
+
+	map_timing[IOPT_IMPL].avg_time =
+		div64_ul(map_timing[IOPT_IMPL].avg_time, iterations);
+
+	unmap_timing[GENPT_IMPL].avg_time =
+		div64_ul(unmap_timing[GENPT_IMPL].avg_time, iterations);
+
+	unmap_timing[IOPT_IMPL].avg_time =
+		div64_ul(unmap_timing[IOPT_IMPL].avg_time, iterations);
+}
+
+static inline size_t iommu_pgsize_eq(pt_vaddr_t pgsize_bitmap, pt_vaddr_t va,
+                                  pt_oaddr_t pa, size_t size, size_t *count)
+{
+        unsigned int pgsize_idx, pgsize_idx_next;
+        unsigned long pgsizes;
+        size_t offset, pgsize, pgsize_next;
+        unsigned long addr_merge = pa | va;
+
+        /* Page sizes supported by the hardware and small enough for @size */
+        pgsizes = pgsize_bitmap & GENMASK(__fls(size), 0);
+
+        /* Constrain the page sizes further based on the maximum alignment */
+        if (likely(addr_merge))
+                pgsizes &= GENMASK(__ffs(addr_merge), 0);
+
+        /* Make sure we have at least one suitable page size */
+        BUG_ON(!pgsizes);
+
+        /* Pick the biggest page size remaining */
+        pgsize_idx = __fls(pgsizes);
+        pgsize = BIT(pgsize_idx);
+        if (!count)
+                return pgsize;
+
+        /* Find the next biggest support page size, if it exists */
+        pgsizes = pgsize_bitmap & ~GENMASK(pgsize_idx, 0);
+        if (!pgsizes)
+                goto out_set_count;
+
+        pgsize_idx_next = __ffs(pgsizes);
+        pgsize_next = BIT(pgsize_idx_next);
+
+        /*
+         * There's no point trying a bigger page size unless the virtual
+         * and physical addresses are similarly offset within the larger page.
+         */
+        if ((va ^ pa) & (pgsize_next - 1))
+                goto out_set_count;
+
+        /* Calculate the offset to the next page size alignment boundary */
+        offset = pgsize_next - (addr_merge & (pgsize_next - 1));
+
+        /*
+         * If size is big enough to accommodate the larger page, reduce
+         * the number of smaller pages.
+         */
+        if (offset + pgsize_next <= size)
+                size = offset;
+
+out_set_count:
+        *count = size >> pgsize_idx;
+        return pgsize;
+}
+
+static noinline int __iommu_map_eq(struct kunit_iommu_cmp_priv *cmp_priv,
+				   unsigned long iova, phys_addr_t paddr,
+				   size_t size)
+{
+        struct kunit_iommu_priv *genpt_priv = &cmp_priv->fmt;
+	struct io_pgtable_cfg *pgtbl_cfg =
+		&io_pgtable_ops_to_pgtable(cmp_priv->pgtbl_ops)->cfg;
+	pt_vaddr_t pgsize_bitmap = genpt_priv->safe_pgsize_bitmap &
+				   pgtbl_cfg->pgsize_bitmap;
+	unsigned int prot = (IOMMU_READ | IOMMU_WRITE);
+	unsigned int min_pagesz;
+	int ret = 0;
+
+	/* find out the minimum page size supported */
+	min_pagesz = 1 << __ffs(pgsize_bitmap);
+
+	/*
+	 * both the virtual address and the physical one, as well as
+	 * the size of the mapping, must be aligned (at least) to the
+	 * size of the smallest page supported by the hardware
+	 */
+	if (!IS_ALIGNED(iova | paddr | size, min_pagesz))
+		return -EINVAL;
+
+	while (size) {
+		size_t pgsize, count, mapped = 0;
+
+                pgsize = iommu_pgsize_eq(pgsize_bitmap, iova, paddr, size, &count);
+
+		ret = cmp_priv->pgtbl_ops->map_pages(cmp_priv->pgtbl_ops, iova,
+						     paddr, pgsize, count, prot,
+						     GFP_KERNEL, &mapped);
+		/*
+		 * Some pages may have been mapped, even if an error occurred,
+		 * so we should account for those so they can be unmapped.
+		 */
+		size -= mapped;
+
+		if (ret)
+			break;
+
+		iova += mapped;
+		paddr += mapped;
+	}
+
+	return ret;
+}
+
+static inline void update_min_time(ktime_t *cur_min, ktime_t delta)
+{
+	if (likely(*cur_min))
+		*cur_min = min_t(ktime_t, *cur_min, delta);
+	else
+		*cur_min = delta;
+}
+
+static inline void update_max_time(ktime_t *cur_max, ktime_t delta)
+{
+	*cur_max = max_t(ktime_t, *cur_max, delta);
+}
+
+static inline void update_measurements(struct benchmark_times *timing, ktime_t delta)
+{
+	timing->avg_time += delta;
+
+	update_max_time(&timing->max_time, delta);
+
+	update_min_time(&timing->min_time, delta);
+}
+
+static void time_map_pages(struct kunit *test, pt_vaddr_t va, pt_oaddr_t pa,
+			   pt_vaddr_t len, struct benchmark_times *map_timing)
+{
+
+	struct kunit_iommu_cmp_priv *cmp_priv = test->priv;
+	struct kunit_iommu_priv *priv = &cmp_priv->fmt;
+	const struct pt_iommu_ops *ops = priv->iommu->ops;
+
+	ktime_t delta;
+	unsigned int prot = (IOMMU_READ | IOMMU_WRITE);
+	size_t mapped = 0;
+	int ret_map;
+
+	START_TIMER(genpt);
+	ret_map = ops->map_range(priv->iommu, va, pa, len, prot, GFP_KERNEL,
+				 &mapped, NULL);
+	delta = STOP_TIMER(genpt);
+
+	update_measurements(&map_timing[GENPT_IMPL], delta);
+
+	KUNIT_EXPECT_EQ(test, ret_map, 0);
+	KUNIT_EXPECT_EQ(test, mapped, len);
+	/*
+	 * Emulate overhead from the iommu common code before calling io pgtbl
+	 * operations. i.e.
+	 *
+	 * iommu_map()
+	 *      __iommu_map()
+	 *              iommu_pgsize()
+	 * For now, assume Non-present table entries are not cached, i.e.
+	 * there is no overhead in iommu_map() due to calling:
+	 * iotlb_sync_map()-->domain_flush_np_cache().
+	 */
+	START_TIMER(iopt);
+
+	ret_map = __iommu_map_eq(cmp_priv, va, pa, len);
+
+	delta = STOP_TIMER(iopt);
+
+	update_measurements(&map_timing[IOPT_IMPL], delta);
+
+	KUNIT_EXPECT_EQ(test, ret_map, 0);
+
+        /*
+         * TODO: verify that the requested length was completely mapped. Easy
+         * but perhaps not needed since other tests confirm it already.
+         */
+        //KUNIT_EXPECT_EQ(test, mapped, len);
+}
+
+static size_t noinline __iommu_unmap_eq(
+	struct kunit_iommu_cmp_priv *cmp_priv, unsigned long iova, size_t size,
+	struct iommu_iotlb_gather *iotlb_gather)
+{
+        struct kunit_iommu_priv *genpt_priv = &cmp_priv->fmt;
+	struct io_pgtable_cfg *pgtbl_cfg =
+		&io_pgtable_ops_to_pgtable(cmp_priv->pgtbl_ops)->cfg;
+	pt_vaddr_t pgsize_bitmap = genpt_priv->safe_pgsize_bitmap &
+				   pgtbl_cfg->pgsize_bitmap;
+	size_t unmapped_page, unmapped = 0;
+	unsigned int min_pagesz;
+
+	/* find out the minimum page size supported */
+	min_pagesz = 1 << __ffs(pgsize_bitmap);
+
+	/*
+	 * The virtual address, as well as the size of the mapping, must be
+	 * aligned (at least) to the size of the smallest page supported
+	 * by the hardware
+	 */
+	if (!IS_ALIGNED(iova | size, min_pagesz))
+		return 0;
+
+	/*
+	 * Keep iterating until we either unmap 'size' bytes (or more)
+	 * or we hit an area that isn't mapped.
+	 */
+	while (unmapped < size) {
+		size_t pgsize, count;
+
+		pgsize = iommu_pgsize_eq(pgsize_bitmap, iova, iova, size - unmapped, &count);
+		unmapped_page = cmp_priv->pgtbl_ops->unmap_pages(
+			cmp_priv->pgtbl_ops, iova, pgsize, count, iotlb_gather);
+		if (!unmapped_page)
+			break;
+
+		iova += unmapped_page;
+		unmapped += unmapped_page;
+	}
+	return unmapped;
+}
+
+static void time_unmap_pages(struct kunit *test, pt_vaddr_t va, pt_vaddr_t len,
+			     struct benchmark_times *unmap_timing)
+{
+
+	struct kunit_iommu_cmp_priv *cmp_priv = test->priv;
+	struct kunit_iommu_priv *priv = &cmp_priv->fmt;
+	const struct pt_iommu_ops *ops = priv->iommu->ops;
+	size_t ret_unmap;
+	ktime_t delta;
+
+	START_TIMER(genpt);
+	ret_unmap = ops->unmap_range(priv->iommu, va, len, NULL);
+	delta = STOP_TIMER(genpt);
+
+	update_measurements(&unmap_timing[GENPT_IMPL], delta);
+
+	KUNIT_EXPECT_EQ(test, ret_unmap, len);
+
+	START_TIMER(iopt);
+	ret_unmap = __iommu_unmap_eq(cmp_priv, va, len, NULL);
+	delta = STOP_TIMER(iopt);
+
+	update_measurements(&unmap_timing[IOPT_IMPL], delta);
+
+	KUNIT_EXPECT_EQ(test, ret_unmap, len);
+}
+
+/*
+ * Test {un}map_pages(), no mem allocation.
+ */
+static void do_map_unmap_benchmark(struct kunit *test,
+				   void *test_args,
+				   unsigned int pgsz_lg2)
+{
+	struct kunit_iommu_cmp_priv *cmp_priv = test->priv;
+	struct kunit_iommu_priv *genpt_priv = &cmp_priv->fmt;
+
+	struct map_unmap_test_cfg *test_case = test_args;
+
+	struct pt_range top_range = pt_top_range(cmp_priv->fmt.common);
+	struct cmp_benchmark_results *benchmark_entry =
+		&test_case->cmp_results[pgsz_lg2];
+
+	struct benchmark_times *map_timing =
+		(struct benchmark_times *)benchmark_entry->map_timing;
+	struct benchmark_times *unmap_timing =
+		(struct benchmark_times *)benchmark_entry->unmap_timing;
+
+	unsigned int loops = 0;
+
+	pt_vaddr_t test_va, len;
+	pt_oaddr_t test_pa;
+
+	/*
+	 * Enforce minimum pgsize alignment requirement for pa/va.
+	 * test_oa is initialized during test suite init.
+	 */
+	test_pa = oalog2_set_mod(genpt_priv->test_oa, 0, pgsz_lg2);
+	test_va = ALIGN(top_range.va + genpt_priv->smallest_pgsz,
+			log2_to_int(pgsz_lg2));
+
+	/* If test case does not specify IOPTE count, assume 1 */
+	if (!test_case->iopte_cnt)
+		test_case->iopte_cnt = 1;
+
+	len = test_case->iopte_cnt * log2_to_int(pgsz_lg2);
+	/* Throw away first mapping to avoid timing memory allocation */
+	time_map_pages(test, test_va, test_pa, len, map_timing);
+	time_unmap_pages(test, test_va, len, unmap_timing);
+	memset(benchmark_entry, 0, sizeof(*benchmark_entry));
+
+	/* FIXME, I noticed these do memory allocations anyhow, so something is
+	 * wrong */
+
+	/* Timing loop */
+	for (loops = 0; loops < LOOPS; loops++) {
+
+		/* map_pages() benchmark */
+		time_map_pages(test, test_va, test_pa, len, map_timing);
+
+		/* unmap_pages() benchmark */
+		time_unmap_pages(test, test_va, len, unmap_timing);
+
+		/*
+		 * TODO: Ensure that va does not exceed valid range.
+		 * PA overflows a lot faster since OA_MAX is 52 bits.
+		 * Ultimately there is no need to increase PA and the
+		 * incremental VAs can all be mapped to same PA.
+		 * TODO: Implement fair increment of PA/VA
+		 */
+	}
+
+	/*
+	 * Calculate avg duration for both implementations.
+	 * TODO: use MEASURE_{} macros to improve readability.
+	 */
+	compute_map_timing_stats(benchmark_entry, loops);
+}
+
+static inline void test_on_valid_pgsize(struct kunit *test, benchmark_fn_t fn,
+				void *test_args, pt_vaddr_t pgsize_bitmap)
+{
+	unsigned int pgsz_lg2;
+
+	for (pgsz_lg2 = 0; pgsz_lg2 != PT_VADDR_MAX_LG2; pgsz_lg2++) {
+
+		/* Skip unsupported page sizes */
+		if (!(pgsize_bitmap & log2_to_int(pgsz_lg2)))
+			 continue;
+
+		fn(test, test_args, pgsz_lg2);
+	}
+}
+
+#define REPORT_BANNER_STR(op)						\
+	"\n" op " \npgsz,genpt,iopt,min_genpt,min_iopt,max_genpt,max_iopt\n"
+
+#define REPORT_FMT_STR	"%u, %lld, %lld, %lld, %lld, %lld, %lld\n"
+
+#define REPORT_PARAM_LIST						\
+	idx, result[GENPT_IMPL].avg_time, result[IOPT_IMPL].avg_time,	\
+	result[GENPT_IMPL].min_time, result[IOPT_IMPL].min_time,	\
+	result[GENPT_IMPL].max_time, result[IOPT_IMPL].max_time		\
+
+static void report_timing_results(struct kunit *test, pt_vaddr_t pgsize_bitmap,
+				  struct cmp_benchmark_results *cmp_results)
+{
+	/*
+	 * Now all the timing results have been populated, output them in CSV
+	 * format for plotting.
+	 */
+	kunit_info(test, REPORT_BANNER_STR("map_pages"));
+	for (int idx = 0; idx < PT_VADDR_MAX_LG2; idx++) {
+		if (!(pgsize_bitmap & BIT(idx)))
+			continue;
+
+		struct benchmark_times *result =
+			(struct benchmark_times *)cmp_results[idx].map_timing;
+
+		pr_info(REPORT_FMT_STR, REPORT_PARAM_LIST);
+	}
+
+	kunit_info(test, REPORT_BANNER_STR("unmap_pages"));
+	for (int idx = 0; idx < PT_VADDR_MAX_LG2; idx++) {
+		if (!(pgsize_bitmap & BIT(idx)))
+			continue;
+
+		struct benchmark_times *result =
+			(struct benchmark_times *)cmp_results[idx].unmap_timing;
+
+		pr_info(REPORT_FMT_STR, REPORT_PARAM_LIST);
+	}
+
+	memset(cmp_results, 0, sizeof(*cmp_results));
+}
+
+struct map_unmap_test_cfg NS(map_unmap_tests)[] = {
+	{
+		.iopte_cnt = 1,
+		.desc = "Single IOPTE",
+	},
+	{
+		.iopte_cnt = 256,
+		.pgsize_bitmap = (SZ_4K | SZ_2M | SZ_1G),
+		.desc = "256 IOPTE",
+	},
+};
+
+/*
+ * Benchmark map/unmap various combinations defined by NS(map_unmap_tests) list.
+ * This test is a clear candidate for the parameterized testing support offered
+ * by Kunit framework, but that facility is already in use for testing of format
+ * specific features, so set this up manually.
+ */
+static void test_map_unmap_benchmark(struct kunit *test)
+{
+	struct kunit_iommu_cmp_priv *cmp_priv = test->priv;
+	struct kunit_iommu_priv *genpt_priv = &cmp_priv->fmt;
+
+	/*
+	 * Use safe pgsize_bitmap determined during test initialization as
+	 * baseline, and restrict the pgsizes if required by specific tests.
+	 */
+	pt_vaddr_t pgsize_bitmap = genpt_priv->safe_pgsize_bitmap;
+
+	/*
+	 * Allocate array of struct commpare_timings holding PT_VADDR_MAX_LG2
+	 * entries for comparison benchmarks. Entries for unsupported pagesizes
+	 * are wasted, so this can be optimized.
+	 */
+	struct cmp_benchmark_results *cmp_results =
+		kunit_kzalloc(test, sizeof(*cmp_results) * PT_VADDR_MAX_LG2,
+				GFP_KERNEL);
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(NS(map_unmap_tests)); i++) {
+
+		/* Restrict supported pagesizes if test case requests it */
+		if (NS(map_unmap_tests)[i].pgsize_bitmap)
+			pgsize_bitmap &= NS(map_unmap_tests)[i].pgsize_bitmap;
+
+		NS(map_unmap_tests)[i].cmp_results = cmp_results;
+
+		test_on_valid_pgsize(test, do_map_unmap_benchmark,
+				     &NS(map_unmap_tests)[i],
+				     pgsize_bitmap);
+
+		kunit_info(test, "\nTest case: %s\n",
+			   NS(map_unmap_tests)[i].desc);
+
+		report_timing_results(test, pgsize_bitmap, cmp_results);
+	}
+}
+#endif
 
 static void test_cmp_one_map(struct kunit *test)
 {
@@ -371,6 +861,9 @@ static struct kunit_case cmp_test_cases[] = {
 	KUNIT_CASE_FMT(test_cmp_one_map),
 	KUNIT_CASE_FMT(test_cmp_high_va),
 	KUNIT_CASE_FMT(test_cmp_unmap_split),
+#if IS_ENABLED(CONFIG_IOMMU_PT_KUNIT_BENCHMARK)
+	KUNIT_CASE_FMT(test_map_unmap_benchmark),
+#endif
 	{},
 };
 

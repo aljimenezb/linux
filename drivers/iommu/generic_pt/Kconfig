@@ -114,5 +114,13 @@ config IOMMU_PT_KUNIT_TEST
 	depends on IOMMU_PT_VTDSS || !IOMMU_PT_VTDSS
 	depends on IOMMU_PT_X86PAE || !IOMMU_PT_X86PAE
 	default KUNIT_ALL_TESTS
+
+config IOMMU_PT_KUNIT_BENCHMARK
+	bool "IOMMU Page Table Kunit Tests for comparison benchmarks"
+	depends on IOMMU_PT_KUNIT_TEST
+	depends on IOMMU_PT_AMDV1
+	depends on AMD_IOMMU
+	default n
+
 endif
 endif
