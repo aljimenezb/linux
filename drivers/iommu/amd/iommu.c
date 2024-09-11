@@ -2398,6 +2398,16 @@ static struct iommu_domain *amd_iommu_domain_alloc(unsigned int type)
 	return domain;
 }
 
+/*
+ * Allocate domain with default (amd_iommu_pgtable) page table type. Core will
+ * call domain_alloc_user() interface to allocate PASID capable domain.
+ */
+static struct iommu_domain *amd_iommu_domain_alloc_paging(struct device *dev)
+{
+	return do_iommu_domain_alloc(IOMMU_DOMAIN_DMA,
+				     dev, 0, amd_iommu_pgtable);
+}
+
 static struct iommu_domain *
 amd_iommu_domain_alloc_user(struct device *dev, u32 flags,
 			    struct iommu_domain *parent,
@@ -2837,6 +2847,7 @@ static int amd_iommu_dev_disable_feature(struct device *dev,
 const struct iommu_ops amd_iommu_ops = {
 	.capable = amd_iommu_capable,
 	.domain_alloc = amd_iommu_domain_alloc,
+	.domain_alloc_paging = amd_iommu_domain_alloc_paging,
 	.domain_alloc_user = amd_iommu_domain_alloc_user,
 	.domain_alloc_sva = amd_iommu_domain_alloc_sva,
 	.probe_device = amd_iommu_probe_device,
