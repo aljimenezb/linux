@@ -2575,6 +2575,13 @@ static int __iommu_map(struct iommu_domain *domain, unsigned long iova,
 						       paddr, size, prot, gfp,
 						       mapped, iotlb_gather);
 #if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
+	/*
+	 * Preemptively increase mapped on the assumption that
+	 * __iommu_map_domain_pgtbl() will map the entire size requested.
+	 * FIXME: This is not true if errors are returned, because in that case
+	 * __iommu_map_domain_pgtbl unrolls any mappings that it has created.
+	 * so callers should ignore/discard mapped.
+	 */
 	*mapped += size;
 	return __iommu_map_domain_pgtbl(domain, iova, paddr, size, prot, gfp);
 #endif

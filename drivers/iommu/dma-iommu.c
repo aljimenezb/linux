@@ -179,7 +179,7 @@ static void fq_ring_free(struct iommu_dma_cookie *cookie, struct iova_fq *fq)
 static void __flush_all(struct iommu_domain *domain)
 {
 	if (IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT) && domain->iommupt) {
-		domain->iommupt->hw_flush_ops->flush_all(domain->iommupt);
+		domain->iommupt->hw_flush_ops->flush_all(domain);
 		return;
 	}
 #if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)

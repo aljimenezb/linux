@@ -1044,6 +1044,28 @@ static const struct pt_iommu_ops NS(ops) = {
 	.deinit = NS(deinit),
 };
 
+/*
+ * Wrapper for correctly calling the HW driver provided function pointer
+ * to flush all IOMMU HW caches after changes to the page table. In the most
+ * unoptimized form, any table modification / gather can be concluded by
+ * calling flush_all().
+ */
+static void NS(flush_all)(struct iommu_domain *domain)
+{
+       /*
+        * The HW driver provided callback is passed in the iommu_domain ops.
+        * It is a domain specific operation and is set during domain creation
+        * by the driver before initializing the generic_pt framework. Ensure it
+        * has been properly set.
+        */
+       if (domain->ops)
+               domain->ops->flush_iotlb_all(domain);
+}
+
+static const struct pt_iommu_flush_ops NS(hw_flush_ops) = {
+       .flush_all = NS(flush_all),
+};
+
 static int pt_init_common(struct pt_common *common)
 {
 	struct pt_range top_range = pt_top_range(common);
@@ -1136,8 +1158,14 @@ int pt_iommu_init(struct pt_iommu_table *fmt_table,
 	pt_top_set(common, table_mem, pt_top_get_level(common));
 #endif
 	iommu_table->ops = &NS(ops);
-	if (cfg->common.domain)
+	if (cfg->common.domain) {
 		pt_iommu_init_domain(iommu_table, cfg->common.domain);
+		/*
+		 * flush ops are provided by domain, only assign them if domain
+		 * is valid.
+		 */
+		iommu_table->hw_flush_ops = &NS(hw_flush_ops);
+	}
 	return 0;
 }
 EXPORT_SYMBOL_NS_GPL(pt_iommu_init, GENERIC_PT_IOMMU);

@@ -8,6 +8,7 @@
 #include <linux/generic_pt/common.h>
 #include <linux/mm_types.h>
 
+struct iommu_domain;
 struct iommu_iotlb_gather;
 struct pt_iommu_ops;
 struct pt_iommu_flush_ops;
@@ -222,7 +223,7 @@ struct pt_iommu_flush_ops {
 	 * flush_all() - Clear all caches related to this table. Any gather can
 	 * be concluded by calling flush_all.
 	 */
-	void (*flush_all)(struct pt_iommu *iommu_table);
+	void (*flush_all)(struct iommu_domain *domain);
 };
 
 

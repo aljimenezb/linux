@@ -660,18 +660,17 @@ struct iommu_domain_ops {
 			      size_t pgsize, size_t pgcount,
 			      struct iommu_iotlb_gather *iotlb_gather);
 
-	void (*flush_iotlb_all)(struct iommu_domain *domain);
-	int (*iotlb_sync_map)(struct iommu_domain *domain, unsigned long iova,
-			      size_t size);
-	void (*iotlb_sync)(struct iommu_domain *domain,
-			   struct iommu_iotlb_gather *iotlb_gather);
-
 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain,
 				    dma_addr_t iova);
 	int (*set_pgtable_quirks)(struct iommu_domain *domain,
 				  unsigned long quirks);
 	int (*enable_nesting)(struct iommu_domain *domain);
 #endif
+	void (*flush_iotlb_all)(struct iommu_domain *domain);
+	int (*iotlb_sync_map)(struct iommu_domain *domain, unsigned long iova,
+			      size_t size);
+	void (*iotlb_sync)(struct iommu_domain *domain,
+			   struct iommu_iotlb_gather *iotlb_gather);
 
 	int (*cache_invalidate_user)(struct iommu_domain *domain,
 				     struct iommu_user_data_array *array);
@@ -884,6 +883,26 @@ static inline void iommu_iotlb_sync(struct iommu_domain *domain,
 
 	iommu_iotlb_gather_init(iotlb_gather);
 }
+#else /* !CONFIG_IOMMU_DOMAIN_PGTBL i.e. CONFIG_IOMMU_USE_IOMMUPT */
+
+#include <linux/generic_pt/iommu.h>
+
+static inline void iommu_flush_iotlb_all(struct iommu_domain *domain)
+{
+       if (domain->iommupt->hw_flush_ops->flush_all)
+               domain->iommupt->hw_flush_ops->flush_all(domain);
+}
+
+static inline void iommu_iotlb_sync(struct iommu_domain *domain,
+                                   struct iommu_iotlb_gather *iotlb_gather)
+{
+       // FIXME: Using the flush_all() op as a big hammer, since any sync is a
+       // subset of flush_all()
+       iommu_flush_iotlb_all(domain);
+
+       iommu_iotlb_gather_init(iotlb_gather);
+}
+#endif
 
 /**
  * iommu_iotlb_gather_is_disjoint - Checks whether a new range is disjoint
@@ -960,15 +979,6 @@ static inline bool iommu_iotlb_gather_queued(struct iommu_iotlb_gather *gather)
 {
 	return gather && gather->queued;
 }
-#else
-static inline void iommu_iotlb_sync(struct iommu_domain *domain,
-				    struct iommu_iotlb_gather *iotlb_gather)
-{
-	// FIXME
-	iommu_iotlb_gather_init(iotlb_gather);
-}
-
-#endif
 
 static inline void iommu_dirty_bitmap_init(struct iommu_dirty_bitmap *dirty,
 					   struct iova_bitmap *bitmap,

@@ -44,6 +44,10 @@
 #include "../irq_remapping.h"
 #include "../iommu-pages.h"
 
+#if IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT)
+#include <linux/generic_pt/iommu.h>
+#endif
+
 #define CMD_SET_TYPE(cmd, t) ((cmd)->data[1] |= ((t) << 28))
 
 /* Reserved IOVA ranges */
@@ -1573,6 +1577,7 @@ void amd_iommu_domain_flush_complete(struct protection_domain *domain)
 	}
 }
 
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 /* Flush the not present cache if it exists */
 static void domain_flush_np_cache(struct protection_domain *domain,
 		dma_addr_t iova, size_t size)
@@ -1585,7 +1590,7 @@ static void domain_flush_np_cache(struct protection_domain *domain,
 		spin_unlock_irqrestore(&domain->lock, flags);
 	}
 }
-
+#endif
 
 /*
  * This function flushes the DTEs for all devices in domain
@@ -2263,7 +2268,11 @@ void protection_domain_free(struct protection_domain *domain)
 {
 	WARN_ON(!list_empty(&domain->dev_list));
 	if (domain->domain.type & __IOMMU_DOMAIN_PAGING)
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 		free_io_pgtable_ops(&domain->iop.pgtbl.ops);
+#elif IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT)
+		pt_iommu_deinit(&domain->iommu);
+#endif
 	domain_id_free(domain->id);
 	kfree(domain);
 }
@@ -2296,10 +2305,9 @@ struct protection_domain *protection_domain_alloc(unsigned int type, int nid)
 }
 
 static int pdom_setup_pgtable(struct protection_domain *domain,
+			      struct device *dev,
 			      unsigned int type, int pgtable)
 {
-	struct io_pgtable_ops *pgtbl_ops;
-
 	/* No need to allocate io pgtable ops in passthrough mode */
 	if (!(type & __IOMMU_DOMAIN_PAGING))
 		return 0;
@@ -2314,11 +2322,42 @@ static int pdom_setup_pgtable(struct protection_domain *domain,
 	default:
 		return -EINVAL;
 	}
-
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
+	struct io_pgtable_ops *pgtbl_ops;
 	pgtbl_ops =
 		alloc_io_pgtable_ops(pgtable, &domain->iop.pgtbl.cfg, domain);
 	if (!pgtbl_ops)
 		return -ENOMEM;
+
+#elif IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT)
+
+	/* Use the generic pt framework to initialize the domain */
+	// TODO: account for pgtable types other than v1
+	struct pt_iommu_amdv1_cfg cfg = {};
+
+	// TODO: Check that assigning default ops here is ok
+	/*
+	 * Initialize all default ops, including the flush* op that iommupt
+	 * assigns to hw_flush_ops
+	 */
+	domain->domain.ops = amd_iommu_ops.default_domain_ops;
+	cfg.common.domain = &domain->domain;
+
+	/*
+	 * Generic PT requires a pointer to the iommu device.
+	 * TODO: add it to struct protection_domain if it makes sense
+	 */
+	cfg.common.iommu_device = dev->iommu->iommu_dev->dev;
+
+	cfg.common.hw_max_vasz_lg2 = 64;
+	cfg.common.hw_max_oasz_lg2 = 52;
+	cfg.starting_level = 2;
+
+	/* Initialize the generic pt framework, using the cfg data */
+	// TODO: Confirm the io pgtable ops are not initialized i.e.
+	// if (WARN_ON(pdom->iop.pgtbl.ops)) goto err_free;
+	return pt_iommu_amdv1_init(&domain->amdv1, &cfg, GFP_KERNEL);
+#endif
 
 	return 0;
 }
@@ -2364,24 +2403,31 @@ static struct iommu_domain *do_iommu_domain_alloc(unsigned int type,
 	if (!domain)
 		return ERR_PTR(-ENOMEM);
 
-	ret = pdom_setup_pgtable(domain, type, pgtable);
+	ret = pdom_setup_pgtable(domain, dev, type, pgtable);
 	if (ret) {
 		domain_id_free(domain->id);
 		kfree(domain);
 		return ERR_PTR(ret);
 	}
 
-	domain->domain.geometry.aperture_start = 0;
-	domain->domain.geometry.aperture_end   = dma_max_address(pgtable);
-	domain->domain.geometry.force_aperture = true;
-	domain->domain.pgsize_bitmap = domain->iop.pgtbl.cfg.pgsize_bitmap;
+	/*
+	 * When using IOMMUPT, the domain geometry and pgsize_bitmap have been
+	 * initialized already while setting up the page tables, so skip it in
+	 * that case.
+	 */
+	if (!IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT)) {
+		domain->domain.geometry.aperture_start = 0;
+		domain->domain.geometry.aperture_end   = dma_max_address(pgtable);
+		domain->domain.geometry.force_aperture = true;
+		domain->domain.pgsize_bitmap = domain->iop.pgtbl.cfg.pgsize_bitmap;
 
-	if (iommu) {
-		domain->domain.type = type;
-		domain->domain.ops = iommu->iommu.ops->default_domain_ops;
+		if (iommu) {
+			domain->domain.type = type;
+			domain->domain.ops = iommu->iommu.ops->default_domain_ops;
 
-		if (dirty_tracking)
-			domain->domain.dirty_ops = &amd_dirty_ops;
+			if (dirty_tracking)
+				domain->domain.dirty_ops = &amd_dirty_ops;
+		}
 	}
 
 	return &domain->domain;
@@ -2536,6 +2582,7 @@ static int amd_iommu_attach_device(struct iommu_domain *dom,
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 static int amd_iommu_iotlb_sync_map(struct iommu_domain *dom,
 				    unsigned long iova, size_t size)
 {
@@ -2622,6 +2669,7 @@ static phys_addr_t amd_iommu_iova_to_phys(struct iommu_domain *dom,
 
 	return ops->iova_to_phys(ops, iova);
 }
+#endif /* CONFIG_IOMMU_DOMAIN_PGTBL */
 
 static bool amd_iommu_capable(struct device *dev, enum iommu_cap cap)
 {
@@ -2690,6 +2738,7 @@ static int amd_iommu_set_dirty_tracking(struct iommu_domain *domain,
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 static int amd_iommu_read_and_clear_dirty(struct iommu_domain *domain,
 					  unsigned long iova, size_t size,
 					  unsigned long flags,
@@ -2711,6 +2760,7 @@ static int amd_iommu_read_and_clear_dirty(struct iommu_domain *domain,
 
 	return ops->read_and_clear_dirty(ops, iova, size, flags, dirty);
 }
+#endif
 
 static void amd_iommu_get_resv_regions(struct device *dev,
 				       struct list_head *head)
@@ -2836,7 +2886,9 @@ static bool amd_iommu_enforce_cache_coherency(struct iommu_domain *domain)
 
 static const struct iommu_dirty_ops amd_dirty_ops = {
 	.set_dirty_tracking = amd_iommu_set_dirty_tracking,
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 	.read_and_clear_dirty = amd_iommu_read_and_clear_dirty,
+#endif
 };
 
 static int amd_iommu_dev_enable_feature(struct device *dev,
@@ -2890,10 +2942,12 @@ const struct iommu_ops amd_iommu_ops = {
 	.page_response = amd_iommu_page_response,
 	.default_domain_ops = &(const struct iommu_domain_ops) {
 		.attach_dev	= amd_iommu_attach_device,
+#if IS_ENABLED(CONFIG_IOMMU_DOMAIN_PGTBL)
 		.map_pages	= amd_iommu_map_pages,
 		.unmap_pages	= amd_iommu_unmap_pages,
-		.iotlb_sync_map	= amd_iommu_iotlb_sync_map,
 		.iova_to_phys	= amd_iommu_iova_to_phys,
+		.iotlb_sync_map	= amd_iommu_iotlb_sync_map,
+#endif
 		.flush_iotlb_all = amd_iommu_flush_iotlb_all,
 		.iotlb_sync	= amd_iommu_iotlb_sync,
 		.free		= amd_iommu_domain_free,
