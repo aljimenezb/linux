@@ -651,6 +651,7 @@ static int pt_iommu_clear_contig(const struct pt_state *start_pts,
 		pt_init(&range, start_pts->level, start_pts->table);
 	struct pt_iommu_collect_args collect = {
 		.free_list = PT_RADIX_LIST_INIT,
+		.ignore_mapped = true,
 	};
 	int ret;
 
@@ -908,9 +909,10 @@ struct pt_unmap_args {
 	struct pt_radix_list_head free_list;
 	pt_vaddr_t unmapped;
 };
-
-static int __unmap_pages(struct pt_range *range, void *arg, unsigned int level,
-			 struct pt_table_p *table)
+static __always_inline int __do_unmap_pages(struct pt_range *range, void *arg,
+					   unsigned int level,
+					   struct pt_table_p *table,
+					   pt_level_fn_t descend_fn)
 {
 	struct iommu_write_log wlog __cleanup(done_writes) = { .range = range };
 	struct pt_state pts = pt_init(range, level, table);
@@ -923,7 +925,7 @@ static int __unmap_pages(struct pt_range *range, void *arg, unsigned int level,
 			bool fully_covered = pt_entry_fully_covered(
 				&pts, pt_table_item_lg2sz(&pts));
 
-			ret = pt_descend(&pts, arg, __unmap_pages);
+			ret = pt_descend(&pts, arg, descend_fn);
 			if (ret)
 				return ret;
 
@@ -963,6 +965,7 @@ static int __unmap_pages(struct pt_range *range, void *arg, unsigned int level,
 	}
 	return 0;
 }
+PT_MAKE_LEVELS(__unmap_pages, __do_unmap_pages);
 
 static size_t NS(unmap_pages)(struct pt_iommu *iommu_table, dma_addr_t iova,
 			      dma_addr_t len,
