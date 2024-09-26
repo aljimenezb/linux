@@ -37,12 +37,22 @@ struct map_unmap_test_case {
 
 struct compare_map_timings {
 	ktime_t map_genpt_ns;
+	ktime_t max_genpt;
+	ktime_t min_genpt;
+
 	ktime_t map_iopt_ns;
+	ktime_t max_iopt;
+	ktime_t min_iopt;
 };
 
 struct compare_unmap_timings {
 	ktime_t unmap_genpt_ns;
+	ktime_t max_genpt;
+	ktime_t min_genpt;
+
 	ktime_t unmap_iopt_ns;
+	ktime_t max_iopt;
+	ktime_t min_iopt;
 };
 
 struct compare_timings {
@@ -320,6 +330,7 @@ static void time_map_pages(struct kunit *test, pt_vaddr_t va, pt_oaddr_t pa,
 	struct kunit_iommu_priv *priv = &cmp_priv->fmt;
 	const struct pt_iommu_ops *ops = priv->iommu->ops;
 
+	ktime_t delta;
 	unsigned int prot = (IOMMU_READ | IOMMU_WRITE);
 	size_t mapped;
 	int ret_map;
@@ -328,30 +339,48 @@ static void time_map_pages(struct kunit *test, pt_vaddr_t va, pt_oaddr_t pa,
 	ktime_t start_genpt_map = ktime_get();
 	ret_map = ops->map_pages(priv->iommu, va, pa, len, prot, GFP_KERNEL,
 				 &mapped, NULL);
-	map_timing->map_genpt_ns += ktime_to_ns(ktime_sub(ktime_get(),
-						start_genpt_map));
+	delta = ktime_to_ns(ktime_sub(ktime_get(), start_genpt_map));
+
+	map_timing->map_genpt_ns += delta;
+	map_timing->max_genpt = max_t(ktime_t, delta, map_timing->max_genpt);
+
+	if (likely(map_timing->min_genpt)) {
+		map_timing->min_genpt = min_t(ktime_t, delta,
+					      map_timing->min_genpt);
+	} else {
+		map_timing->min_genpt = delta;
+	}
 
 	KUNIT_EXPECT_EQ(test, ret_map, 0);
 	KUNIT_EXPECT_EQ(test, mapped, len);
-        /*
-         * Emulate overhead from the iommu common code before calling io pgtbl
-         * operations. i.e.
-         *
-         * iommu_map()
-         *      __iommu_map()
-         *              iommu_pgsize()
-         * For now, assume Non-present table entries are not cached, i.e.
-         * there is no overhead in iommu_map() due to calling:
-         * iotlb_sync_map()-->domain_flush_np_cache().
-         */
-        ktime_t start_iopt_map = ktime_get();
+	/*
+	 * Emulate overhead from the iommu common code before calling io pgtbl
+	 * operations. i.e.
+	 *
+	 * iommu_map()
+	 *      __iommu_map()
+	 *              iommu_pgsize()
+	 * For now, assume Non-present table entries are not cached, i.e.
+	 * there is no overhead in iommu_map() due to calling:
+	 * iotlb_sync_map()-->domain_flush_np_cache().
+	 */
+	ktime_t start_iopt_map = ktime_get();
 
-        ret_map = __iommu_map_eq(cmp_priv, va, pa, len);
+	ret_map = __iommu_map_eq(cmp_priv, va, pa, len);
 
-        map_timing->map_iopt_ns += ktime_to_ns(ktime_sub(ktime_get(),
-							 start_iopt_map));
+	delta = ktime_to_ns(ktime_sub(ktime_get(), start_iopt_map));
 
-        KUNIT_EXPECT_EQ(test, ret_map, 0);
+	map_timing->map_iopt_ns += delta;
+	map_timing->max_iopt = max_t(ktime_t, delta, map_timing->max_iopt);
+
+	if (likely(map_timing->min_iopt)) {
+		map_timing->min_iopt = min_t(ktime_t, delta,
+					      map_timing->min_iopt);
+	} else {
+		map_timing->min_iopt = delta;
+	}
+
+	KUNIT_EXPECT_EQ(test, ret_map, 0);
 
         /*
          * TODO: verify that the requested length was completely mapped. Easy
@@ -408,20 +437,40 @@ static void time_unmap_pages(struct kunit *test, pt_vaddr_t va, pt_vaddr_t len,
 	struct kunit_iommu_priv *priv = &cmp_priv->fmt;
 	const struct pt_iommu_ops *ops = priv->iommu->ops;
 	size_t ret_unmap;
+	ktime_t delta;
 
 	ktime_t start_genpt_unmap = ktime_get();
 
 	ret_unmap = ops->unmap_pages(priv->iommu, va, len, NULL);
 
-	unmap_timing->unmap_genpt_ns += ktime_to_ns(ktime_sub(ktime_get(),
-						  start_genpt_unmap));
+	delta = ktime_to_ns(ktime_sub(ktime_get(), start_genpt_unmap));
+
+	unmap_timing->unmap_genpt_ns += delta;
+	unmap_timing->max_genpt = max_t(ktime_t, delta, unmap_timing->max_genpt);
+
+	if (likely(unmap_timing->min_genpt)) {
+		unmap_timing->min_genpt = min_t(ktime_t, delta,
+						unmap_timing->min_genpt);
+	} else {
+		unmap_timing->min_genpt = delta;
+	}
 
 	KUNIT_EXPECT_EQ(test, ret_unmap, len);
 
 	ktime_t start_iopt_unmap = ktime_get();
 	ret_unmap = __iommu_unmap_eq(cmp_priv, va, len, NULL);
-	unmap_timing->unmap_iopt_ns += ktime_to_ns(ktime_sub(ktime_get(),
-						 start_iopt_unmap));
+
+	delta += ktime_to_ns(ktime_sub(ktime_get(), start_iopt_unmap));
+
+	unmap_timing->unmap_iopt_ns += delta;
+	unmap_timing->max_iopt = max_t(ktime_t, delta, unmap_timing->max_iopt);
+
+	if (likely(unmap_timing->min_iopt)) {
+		unmap_timing->min_iopt = min_t(ktime_t, delta,
+						unmap_timing->min_iopt);
+	} else {
+		unmap_timing->min_iopt = delta;
+	}
 
 	KUNIT_EXPECT_EQ(test, ret_unmap, len);
 }
@@ -512,26 +561,29 @@ static void report_timing_results(struct kunit *test, pt_vaddr_t pgsize_bitmap,
 	 * format for plotting.
 	 * TODO: Write formatting methods.
 	 */
-	kunit_info(test, "map_pages():\npgsz,genpt,iopt\n");
+	kunit_info(test, "map_pages():\npgsz,genpt,iopt,min_genpt,min_iopt,max_genpt,max_iopt\n");
 	for (int idx = 0; idx < PT_VADDR_MAX_LG2; idx++) {
 		if (!(pgsize_bitmap & BIT(idx)))
 			continue;
 		struct compare_map_timings map = timing_results[idx].map_time;
 
-		pr_info("%u, %lld, %lld\n",
-			idx, map.map_genpt_ns, map.map_iopt_ns);
+		pr_info("%u, %lld, %lld, %lld, %lld, %lld, %lld\n",
+			idx, map.map_genpt_ns, map.map_iopt_ns,
+			map.min_genpt, map.min_iopt,
+			map.max_genpt, map.max_iopt);
 	}
 
-	kunit_info(test, "unmap_pages():\npgsz,genpt,iopt\n");
+	kunit_info(test, "unmap_pages():\npgsz,genpt,iopt,min_genpt,min_iopt,max_genpt,max_iopt\n");
 	for (int idx = 0; idx < PT_VADDR_MAX_LG2; idx++) {
 		if (!(pgsize_bitmap & BIT(idx)))
 			continue;
 		struct compare_unmap_timings unmap =
 						timing_results[idx].unmap_time;
 
-		pr_info("%u, %lld, %lld\n",
-			idx, unmap.unmap_genpt_ns, unmap.unmap_iopt_ns);
-
+		pr_info("%u, %lld, %lld, %lld, %lld, %lld, %lld\n",
+			idx, unmap.unmap_genpt_ns, unmap.unmap_iopt_ns,
+			unmap.min_genpt, unmap.min_iopt,
+			unmap.max_genpt, unmap.max_iopt);
 	}
 
 	memset(timing_results, 0, sizeof(*timing_results));
