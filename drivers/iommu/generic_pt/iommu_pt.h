@@ -942,23 +942,40 @@ static int __unmap_pages(struct pt_range *range, void *arg, unsigned int level,
 		}
 		case PT_ENTRY_EMPTY:
 			return -EFAULT;
-		case PT_ENTRY_OA:
+		case PT_ENTRY_OA: {
+			unsigned int oasz_lg2 = pt_entry_oa_lg2sz(&pts);
+
 			/*
 			 * The IOMMU API does not require drivers to support
-			 * unmapping parts of pages. Only legacy VFIO type 1 v1
-			 * will attempt it after probing for "fine-grained
-			 * superpages" support. There it allows the v1 version
-			 * of VFIO (that nobody uses) to pass more than
-			 * PAGE_SIZE to map.
+			 * unmapping parts of large pages. Long ago VFIO would
+			 * try to split maps but the current version never does.
+			 *
+			 * VFIO also has a probe for something it calls
+			 * "fine-grained superpages", this means the driver does
+			 * not support splitting large IOPTEs and will unmap the
+			 * entire IOPTE, regardless of requested unmap range,
+			 * when requested. This allows vfio to avoid a
+			 * iommu_iova_to_phys() loop because it can discover the
+			 * true page size.
+			 *
+			 * This matches the historical behavior of AMD where
+			 * there is no IOPTE splitting (this is not used) and
+			 * unmap will return the IOPTE size. The caller can
+			 * detect this happens by the larger return code. This
+			 * is only permitted if the range starts at an entry.
+			 *
+			 * FIXME: test case
+			 * FIXME: Adjust VFIO's detection to assume this if iommupt
 			 */
-			if (!pt_entry_fully_covered(&pts,
-						    pt_entry_oa_lg2sz(&pts)))
+			if (log2_mod(range->va, oasz_lg2))
 				return -EADDRINUSE;
+
 			unmap->unmapped += log2_to_int(pt_entry_oa_lg2sz(&pts));
 			record_write(&wlog, &pts,
 				     pt_entry_num_contig_lg2(&pts));
 			pt_clear_entry(&pts, pt_entry_num_contig_lg2(&pts));
 			break;
+		}
 		}
 	}
 	return 0;
