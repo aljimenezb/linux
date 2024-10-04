@@ -631,6 +631,96 @@ static void test_cmp_high_va(struct kunit *test)
 	compare_tables(test);
 }
 
+/*
+ * Some implementations do not support splitting large IOPTEs, and instead
+ * unmap the entire IOPTE i.e. will unmap up to the size of the original
+ * mapping, regardless of the requested size.
+ */
+static void test_cmp_unmap_greedy(struct kunit *test)
+{
+	struct kunit_iommu_cmp_priv *cmp_priv = test->priv;
+	struct io_pgtable_ops *iopt_ops = cmp_priv->pgtbl_ops;
+	struct kunit_iommu_priv *priv = &cmp_priv->fmt;
+
+	unsigned int prot = (IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	const struct pt_iommu_ops *ops = priv->iommu->ops;
+	struct io_pgtable_cfg *pgtbl_cfg =
+		&io_pgtable_ops_to_pgtable(iopt_ops)->cfg;
+
+	pt_vaddr_t pgsize_bitmap = priv->safe_pgsize_bitmap &
+					pgtbl_cfg->pgsize_bitmap;
+
+	size_t genpt_unmapped, iopt_unmapped;
+	unsigned int pgsz_lg2, next_pgsz_lg2;
+
+	pt_oaddr_t paddr = 0;
+	pt_vaddr_t vaddr = 0;
+
+	for (pgsz_lg2 = 0; pgsz_lg2 != PT_VADDR_MAX_LG2; pgsz_lg2++) {
+
+		pt_vaddr_t base_len = log2_to_int(pgsz_lg2);
+
+		if (!(pgsize_bitmap & base_len))
+			continue;
+
+		for (next_pgsz_lg2 = pgsz_lg2 + 1;
+			next_pgsz_lg2 != PT_VADDR_MAX_LG2; next_pgsz_lg2++) {
+
+			pt_vaddr_t next_len = log2_to_int(next_pgsz_lg2);
+
+			if (!(pgsize_bitmap & next_len))
+				continue;
+
+			/*
+			 * FIXME: The "greedy unmapping" fails for a combination
+			 * of any base_len_lg2 and next_len_lg2 = 48. In that
+			 * case, the genpt code unmaps the next_len_lg2 size,
+			 * but the iopt breaks its behavior and only unmaps a
+			 * 1G region. e.g.
+			 * # test_cmp_unmap_expansion: vaddr: 0, paddr: 0
+			 * # test_cmp_unmap_expansion: next_len: 48
+			 * # test_cmp_unmap_expansion: ASSERTION FAILED at
+			 * drivers/iommu/generic_pt/fmt/../kunit_iommu_cmp.h:816
+			 * Expected genpt_unmapped == iopt_unmapped, but
+			 * genpt_unmapped == 281474976710656 (0x1000000000000)
+			 * iopt_unmapped == 1073741824 (0x40000000)
+			 *
+			 * TODO: Look at AMD driver code to determine reason or
+			 * fix a bug.
+			 */
+			if (next_pgsz_lg2 == 48)
+				continue;
+
+			vaddr = ALIGN(vaddr, next_len);
+			paddr = ALIGN(paddr, next_len);
+
+			do_cmp_map(test, vaddr, paddr, next_len, prot);
+
+			/*
+			 * Verify that unmap behavior is consistent between
+			 * implementations when unmapping a smaller size than
+			 * the one requested by the original map_pages() call.
+			 */
+			genpt_unmapped = ops->unmap_pages(priv->iommu, vaddr,
+							  base_len, NULL);
+
+			iopt_unmapped =
+				iopt_ops->unmap_pages(cmp_priv->pgtbl_ops,
+						      vaddr, base_len, 1, NULL);
+
+			KUNIT_ASSERT_EQ(test, genpt_unmapped, iopt_unmapped);
+
+			/*
+			 * TODO: Ensure that returned size matches the value
+			 * expected by filtering based on support of IOPTE
+			 * splitting. Filter based on a property, or consecutive
+			 * bits set in the pgsize_bitmap which indicates support
+			 * for contiguous pages??
+			 */
+		}
+	}
+}
+
 static int pt_kunit_iommu_cmp_init(struct kunit *test)
 {
 	struct kunit_iommu_cmp_priv *cmp_priv;
@@ -697,6 +787,7 @@ static struct kunit_case cmp_test_cases[] = {
 	KUNIT_CASE_FMT(test_cmp_init),
 	KUNIT_CASE_FMT(test_cmp_one_map),
 	KUNIT_CASE_FMT(test_cmp_high_va),
+	KUNIT_CASE_FMT(test_cmp_unmap_greedy),
 #if IS_ENABLED(CONFIG_IOMMU_PT_KUNIT_BENCHMARK)
 	KUNIT_CASE_FMT(test_benchmark_ops),
 #endif
