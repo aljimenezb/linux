@@ -124,7 +124,7 @@ static inline void _pt_iter_first(struct pt_state *pts)
 
 static inline bool _pt_iter_load(struct pt_state *pts)
 {
-	if (pts->index == pts->end_index)
+	if (pts->index >= pts->end_index)
 		return false;
 	pt_load_entry(pts);
 	return true;
