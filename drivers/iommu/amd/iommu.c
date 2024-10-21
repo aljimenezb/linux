@@ -77,7 +77,12 @@ static int amd_iommu_attach_device(struct iommu_domain *dom,
 				   struct device *dev);
 
 static void set_dte_entry(struct amd_iommu *iommu,
-			  struct iommu_dev_data *dev_data);
+			  struct iommu_dev_data *dev_data,
+			  phys_addr_t top_paddr, unsigned int top_level);
+
+static void amd_iommu_change_top(struct pt_iommu *iommu_table,
+				 phys_addr_t top_paddr, unsigned int top_level);
+
 static void amd_iommu_flush_iotlb_all(struct pt_iommu *iommu_table);
 
 /****************************************************************************
@@ -1600,7 +1605,7 @@ void amd_iommu_update_and_flush_device_table(struct protection_domain *domain)
 	list_for_each_entry(dev_data, &domain->dev_list, list) {
 		struct amd_iommu *iommu = rlookup_amd_iommu(dev_data->dev);
 
-		set_dte_entry(iommu, dev_data);
+		set_dte_entry(iommu, dev_data, 0, 0);
 		clone_aliases(iommu, dev_data->dev);
 	}
 
@@ -1847,7 +1852,8 @@ int amd_iommu_clear_gcr3(struct iommu_dev_data *dev_data, ioasid_t pasid)
 }
 
 static void set_dte_entry(struct amd_iommu *iommu,
-			  struct iommu_dev_data *dev_data)
+			  struct iommu_dev_data *dev_data,
+			  phys_addr_t top_paddr, unsigned int top_level)
 {
 	u64 pte_root = 0;
 	u64 flags = 0;
@@ -1865,7 +1871,20 @@ static void set_dte_entry(struct amd_iommu *iommu,
 		domid = domain->id;
 
 		if (domain->domain.type & __IOMMU_DOMAIN_PAGING) {
-			pt_iommu_amdv1_hw_info(&domain->amdv1, &pt_info);
+			/*
+			 * When updating the IO pagetable, the new top and level
+			 * are provided as parameters. For other operations i.e.
+			 * device attach, retrieve the current pagetable info
+			 * via the IOMMU PT API.
+			 */
+			if (top_paddr) {
+				pt_info.host_pt_root = top_paddr;
+				pt_info.mode = top_level + 1;
+			} else {
+				WARN_ON(top_paddr || top_level);
+				pt_iommu_amdv1_hw_info(&domain->amdv1,
+						       &pt_info);
+			}
 
 			pte_root = pt_info.host_pt_root;
 			pte_root |= (pt_info.mode & DEV_ENTRY_MODE_MASK)
@@ -1966,7 +1985,7 @@ static void dev_update_dte(struct iommu_dev_data *dev_data, bool set)
 	struct amd_iommu *iommu = get_amd_iommu_from_dev(dev_data->dev);
 
 	if (set)
-		set_dte_entry(iommu, dev_data);
+		set_dte_entry(iommu, dev_data, 0, 0);
 	else
 		clear_dte_entry(iommu, dev_data->devid);
 
@@ -2299,9 +2318,45 @@ static bool amd_iommu_hd_support(struct amd_iommu *iommu)
 	return iommu && (iommu->features & FEATURE_HDSUP);
 }
 
+static spinlock_t *amd_iommu_get_top_lock(struct pt_iommu *iommupt)
+{
+	struct protection_domain *pdom =
+		container_of(iommupt, struct protection_domain, iommu);
+
+	return &pdom->lock;
+}
+
+/*
+ * Update all HW references to the domain with a new pgtable configuration.
+ */
+static void amd_iommu_change_top(struct pt_iommu *iommu_table,
+				 phys_addr_t top_paddr, unsigned int top_level)
+{
+	struct iommu_dev_data *dev_data;
+
+	struct protection_domain *pdom =
+		container_of(iommu_table, struct protection_domain, iommu);
+
+	/* Update the DTE for all devices attached to this domain */
+	list_for_each_entry(dev_data, &pdom->dev_list, list) {
+		struct amd_iommu *iommu = rlookup_amd_iommu(dev_data->dev);
+
+		/* Update the HW references with the new level and top ptr */
+		set_dte_entry(iommu, dev_data, top_paddr, top_level);
+		clone_aliases(iommu, dev_data->dev);
+	}
+
+	list_for_each_entry(dev_data, &pdom->dev_list, list)
+		device_flush_dte(dev_data);
+
+	domain_flush_complete(pdom);
+}
+
+
 static const struct pt_iommu_flush_ops amd_hw_flush_ops = {
 	.flush_all = amd_iommu_flush_iotlb_all,
-	// FIXME change_top
+	.get_top_lock = amd_iommu_get_top_lock,
+	.change_top = amd_iommu_change_top,
 };
 
 static struct iommu_domain *
