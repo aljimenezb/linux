@@ -358,7 +358,7 @@ static inline int amdv1pt_iommu_fmt_init(struct pt_iommu_amdv1 *iommu_table,
 	if (cfg->starting_level == 0 || cfg->starting_level > PT_MAX_TOP_LEVEL)
 		return -EINVAL;
 
-	if (!pt_feature(&table->common, PT_FEAT_DYNAMIC_TOP) ||
+	if (!pt_feature(&table->common, PT_FEAT_DYNAMIC_TOP) &&
 	    cfg->starting_level != PT_MAX_TOP_LEVEL)
 		max_vasz_lg2 = PT_GRANULE_LG2SZ +
 			       (PT_TABLEMEM_LG2SZ - ilog2(sizeof(u64))) *
