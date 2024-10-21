@@ -1857,20 +1857,21 @@ static void set_dte_entry(struct amd_iommu *iommu,
 	struct protection_domain *domain = dev_data->domain;
 	struct dev_table_entry *dev_table = get_dev_table(iommu);
 	struct gcr3_tbl_info *gcr3_info = &dev_data->gcr3_info;
+	struct pt_iommu_amdv1_hw_info pt_info;
 
 	if (gcr3_info && gcr3_info->gcr3_tbl)
 		domid = dev_data->gcr3_info.domid;
-	else
+	else {
 		domid = domain->id;
-/*
-FIXME!!
-pt_iommu_amdv1_hw_info()
-	if (domain->iop.mode != PAGE_MODE_NONE)
-		pte_root = iommu_virt_to_phys(domain->iop.root);
 
-	pte_root |= (domain->iop.mode & DEV_ENTRY_MODE_MASK)
-		    << DEV_ENTRY_MODE_SHIFT;
-*/
+		if (domain->domain.type & __IOMMU_DOMAIN_PAGING) {
+			pt_iommu_amdv1_hw_info(&domain->amdv1, &pt_info);
+
+			pte_root = pt_info.host_pt_root;
+			pte_root |= (pt_info.mode & DEV_ENTRY_MODE_MASK)
+				    << DEV_ENTRY_MODE_SHIFT;
+		}
+	}
 
 	pte_root |= DTE_FLAG_IR | DTE_FLAG_IW | DTE_FLAG_V;
 
@@ -1983,6 +1984,7 @@ static int init_gcr3_table(struct iommu_dev_data *dev_data,
 {
 	struct amd_iommu *iommu = get_amd_iommu_from_dev_data(dev_data);
 	int max_pasids = dev_data->max_pasids;
+	struct pt_iommu_x86pae_hw_info pt_info;
 	int ret = 0;
 
 	 /*
@@ -2005,14 +2007,10 @@ static int init_gcr3_table(struct iommu_dev_data *dev_data,
 	if (!pdom_is_v2_pgtbl_mode(pdom))
 		return ret;
 
-/*
-
-FIXME
-pt_iommu_x86pae_hw_info()
-	ret = update_gcr3(dev_data, 0, iommu_virt_to_phys(pdom->iop.pgd), true);
+	pt_iommu_x86pae_hw_info(&pdom->amdv2, &pt_info);
+	ret = update_gcr3(dev_data, 0, pt_info.gcr3_pt, true);
 	if (ret)
 		free_gcr3_table(&dev_data->gcr3_info);
-*/
 
 	return ret;
 }
@@ -2321,8 +2319,15 @@ do_iommu_domain_alloc_v1(struct device *dev, struct amd_iommu *iommu, u32 flags)
 		domain->domain.dirty_ops = &amd_dirty_ops;
 
 	cfg.common.domain = &domain->domain;
-	cfg.common.features = PT_FEAT_OA_SIZE_CHANGE | PT_FEAT_OA_TABLE_XCHG;
-	/* FIXME PT_FEAT_DYNAMIC_TOP */
+	/* FIXME:
+	 * PT_FEAT_OA_SIZE_CHANGE and/or PT_FEAT_OA_TABLE_XCHG must be
+	 * included in amdv1 fmt PT_SUPPORTED_FEATURES if appropriate.
+	 *
+	 * cfg.common.features = BIT(PT_FEAT_OA_SIZE_CHANGE) |
+	 *			 BIT(PT_FEAT_OA_TABLE_XCHG);
+	 */
+
+	cfg.common.features = BIT(PT_FEAT_DYNAMIC_TOP);
 	cfg.common.hw_max_vasz_lg2 = 64;
 	cfg.common.hw_max_oasz_lg2 = 52;
 	cfg.starting_level = 2;
@@ -2354,7 +2359,16 @@ do_iommu_domain_alloc_v2(struct device *dev, struct amd_iommu *iommu, u32 flags)
 		domain->domain.dirty_ops = &amd_dirty_ops;
 
 	cfg.common.domain = &domain->domain;
-	cfg.common.features = PT_FEAT_OA_SIZE_CHANGE | PT_FEAT_OA_TABLE_XCHG;
+
+	/* FIXME:
+	 * PT_FEAT_OA_SIZE_CHANGE and/or PT_FEAT_OA_TABLE_XCHG need to be
+	 * included in PT_SUPPORTED_FEATURES if appropriate. Currently no
+	 * supported features are declared for x86pae format.
+	 *
+	 * cfg.common.features = BIT(PT_FEAT_OA_SIZE_CHANGE) |
+	 *			 BIT(PT_FEAT_OA_TABLE_XCHG);
+	 */
+
 	if (amd_iommu_gpt_level == PAGE_MODE_5_LEVEL)
 		cfg.common.hw_max_vasz_lg2 = 57;
 	else

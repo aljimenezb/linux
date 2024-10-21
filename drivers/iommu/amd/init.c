@@ -3213,7 +3213,7 @@ static void iommu_snp_enable(void)
 		goto disable_snp;
 	}
 
-	if (amd_iommu_pgtable != AMD_IOMMU_V1) {
+	if (amd_iommu_pgtable != PD_MODE_V1) {
 		pr_warn("SNP: IOMMU is configured with V2 page table mode, SNP cannot be supported.\n");
 		goto disable_snp;
 	}
