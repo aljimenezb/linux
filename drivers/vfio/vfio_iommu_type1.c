@@ -1024,6 +1024,8 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	struct vfio_domain *domain, *d;
 	LIST_HEAD(unmapped_region_list);
 	struct iommu_iotlb_gather iotlb_gather;
+	struct pt_iommu_info pt_info;
+	unsigned long pgsize_bitmap;
 	int unmapped_region_cnt = 0;
 	bool scan_for_contig;
 	long unlocked = 0;
@@ -1049,9 +1051,20 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
 		cond_resched();
 	}
 
-	// FIXME pgsize_bitmap is removed in iommu_pt
+	/*
+	 * When iommu_pt is in use, use the provided op to query the supported
+	 * pagesizes. Otherwise rely on the iommu_domain info.
+	 */
+	if (iommu_is_iommupt_domain(domain->domain)) {
+		domain->domain->iommupt->ops->get_info(domain->domain->iommupt,
+						       &pt_info);
+		pgsize_bitmap = pt_info.pgsize_bitmap;
+	} else {
+		pgsize_bitmap = domain->domain->pgsize_bitmap;
+	}
+
 	scan_for_contig = !iommu_is_iommupt_domain(domain->domain) ||
-			  !(domain->domain->pgsize_bitmap & (2 * PAGE_SIZE));
+			  !(pgsize_bitmap & (2 * PAGE_SIZE));
 	iommu_iotlb_gather_init(&iotlb_gather);
 	while (iova < end) {
 		size_t unmapped, len;
