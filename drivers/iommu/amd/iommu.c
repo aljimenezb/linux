@@ -2045,6 +2045,15 @@ static void set_dte_entry(struct amd_iommu *iommu,
 	if (domain->iop.mode != PAGE_MODE_NONE)
 		new.data[0] = iommu_virt_to_phys(domain->iop.root);
 
+	/*
+	 * DTE[Mode] must be set to 0 when using v2 page table i.e. nested
+	 * translation in pass-through mode with guest translation active.
+	 */
+	if (pdom_is_v2_pgtbl_mode(domain)) {
+		WARN_ON(domain->iop.mode);
+		domain->iop.mode = 0;
+	}
+
 	new.data[0] |= (domain->iop.mode & DEV_ENTRY_MODE_MASK)
 		    << DEV_ENTRY_MODE_SHIFT;
 
