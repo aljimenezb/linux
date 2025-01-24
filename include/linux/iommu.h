@@ -14,6 +14,7 @@
 #include <linux/err.h>
 #include <linux/of.h>
 #include <linux/iova_bitmap.h>
+#include <linux/generic_pt/iommu.h>
 
 #define IOMMU_READ	(1 << 0)
 #define IOMMU_WRITE	(1 << 1)
@@ -215,6 +216,7 @@ struct iommu_domain {
 	unsigned long pgsize_bitmap;	/* Bitmap of page sizes in use */
 	struct iommu_domain_geometry geometry;
 	struct iommu_dma_cookie *iova_cookie;
+	struct pt_iommu *iommupt;
 	int (*iopf_handler)(struct iopf_group *group);
 	void *fault_data;
 	union {
@@ -237,6 +239,11 @@ struct iommu_domain {
 static inline bool iommu_is_dma_domain(struct iommu_domain *domain)
 {
 	return domain->type & __IOMMU_DOMAIN_DMA_API;
+}
+
+static inline bool iommu_is_iommupt_domain(struct iommu_domain *domain)
+{
+	return IS_ENABLED(CONFIG_IOMMU_USE_IOMMUPT) && domain->iommupt;
 }
 
 enum iommu_cap {

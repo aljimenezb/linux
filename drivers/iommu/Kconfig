@@ -28,6 +28,9 @@ menu "Generic IOMMU Pagetable Support"
 # Selected by the actual pagetable implementations
 config IOMMU_IO_PGTABLE
 	bool
+# Selected if the iommu driver uses the Generic Page Table based iommupt ops
+config IOMMU_USE_IOMMUPT
+	bool
 
 config IOMMU_IO_PGTABLE_LPAE
 	bool "ARMv7/v8 Long Descriptor Format"
