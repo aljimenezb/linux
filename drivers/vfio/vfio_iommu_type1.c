@@ -189,7 +189,10 @@ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
 	while (node) {
 		struct vfio_dma *dma = rb_entry(node, struct vfio_dma, node);
 
-		if (start < dma->iova + dma->size) {
+		dma_addr_t next_iova = dma->iova + dma->size;
+
+		if ((start < next_iova) ||
+		   (next_iova < dma->iova)) /* Overflow check */ {
 			res = node;
 			dma_res = dma;
 			if (start >= dma->iova)
@@ -199,8 +202,19 @@ static struct rb_node *vfio_find_dma_first_node(struct vfio_iommu *iommu,
 			node = node->rb_right;
 		}
 	}
-	if (res && size && dma_res->iova >= start + size)
-		res = NULL;
+
+	if (res && size) {
+		/*
+		 * Only return a node if it contains a mapping that overlaps
+		 * with the search range [start, start+size), taking into
+		 * account the potential for integer overflow.
+		 */
+		dma_addr_t range_end = start + size;
+
+		if ((dma_res->iova >= range_end) && (range_end >= start))
+			res = NULL;
+	}
+
 	return res;
 }
 
@@ -1386,7 +1400,9 @@ again:
 
 	while (n) {
 		dma = rb_entry(n, struct vfio_dma, node);
-		if (dma->iova >= iova + size)
+
+		dma_addr_t next_iova = iova + size;
+		if (dma->iova >= next_iova && next_iova >= iova)
 			break;
 
 		if (!iommu->v2 && iova > dma->iova)
